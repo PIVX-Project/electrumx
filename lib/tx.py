@@ -502,4 +502,178 @@ class DeserializerDecred(Deserializer):
             locktime,
             expiry,
             witness
-        ), DeserializerDecred.blake256(no_witness_tx)        
+        ), DeserializerDecred.blake256(no_witness_tx)
+
+
+# =============================================================================
+# PIVX Sapling Support
+# =============================================================================
+
+class SaplingSpend(namedtuple("SaplingSpend",
+                              "cv anchor nullifier rk zkproof spend_auth_sig")):
+    """Represents a Sapling spend description (384 bytes total).
+    
+    Fields:
+        cv: 32 bytes - Value commitment
+        anchor: 32 bytes - Merkle tree root
+        nullifier: 32 bytes - Unique nullifier (reveals note is spent)
+        rk: 32 bytes - Randomized public key
+        zkproof: 192 bytes - Groth16 zero-knowledge proof
+        spend_auth_sig: 64 bytes - Spend authorization signature
+    """
+    pass
+
+
+class SaplingOutput(namedtuple("SaplingOutput",
+                               "cv cmu ephemeral_key enc_ciphertext out_ciphertext zkproof")):
+    """Represents a Sapling output description (948 bytes total).
+    
+    Fields:
+        cv: 32 bytes - Value commitment
+        cmu: 32 bytes - Note commitment (u-coordinate)
+        ephemeral_key: 32 bytes - For ECDH key agreement
+        enc_ciphertext: 580 bytes - Encrypted note plaintext
+        out_ciphertext: 80 bytes - Encrypted data for sender recovery
+        zkproof: 192 bytes - Groth16 zero-knowledge proof
+    """
+    pass
+
+
+class TxPIVXSapling(namedtuple("TxPIVXSapling",
+                               "version tx_type inputs outputs locktime "
+                               "value_balance sapling_spends sapling_outputs "
+                               "binding_sig extra_payload")):
+    """PIVX transaction with Sapling shielded components.
+    
+    Fields:
+        version: Transaction version (3+ for Sapling)
+        tx_type: DIP2-style transaction type (0 for normal)
+        inputs: List of transparent inputs
+        outputs: List of transparent outputs
+        locktime: Transaction locktime
+        value_balance: Net value transferred in/out of shielded pool (signed)
+        sapling_spends: List of SaplingSpend descriptions
+        sapling_outputs: List of SaplingOutput descriptions
+        binding_sig: 64-byte binding signature (empty if no shielded components)
+        extra_payload: Extra data for special transaction types
+    """
+
+    @cachedproperty
+    def is_coinbase(self):
+        return self.inputs[0].is_coinbase if len(self.inputs) > 0 else False
+
+    @property
+    def has_sapling(self):
+        """Returns True if transaction has any Sapling components."""
+        return bool(self.sapling_spends or self.sapling_outputs)
+
+
+class DeserializerPIVXSapling(Deserializer):
+    """Deserializer for PIVX transactions with full Sapling support.
+    
+    Handles PIVX transaction format including:
+    - Version 1-2: Legacy transparent transactions
+    - Version 3+: Sapling-enabled transactions with shielded spends/outputs
+    - DIP2-style special transactions (tx_type in upper 16 bits of version)
+    
+    Sapling component sizes:
+    - vShieldedSpend: 384 bytes each
+    - vShieldedOutput: 948 bytes each
+    - bindingSig: 64 bytes (if any shielded components)
+    """
+    
+    # Size constants for Sapling components
+    SAPLING_SPEND_SIZE = 384  # cv(32) + anchor(32) + nullifier(32) + rk(32) + proof(192) + sig(64)
+    SAPLING_OUTPUT_SIZE = 948  # cv(32) + cmu(32) + epk(32) + enc(580) + out(80) + proof(192)
+    
+    def read_tx(self):
+        """Deserialize a PIVX transaction with Sapling support."""
+        start = self.cursor
+        
+        # Read header (contains version and potentially tx_type)
+        header = self._read_le_uint32()
+        tx_type = header >> 16  # Upper 16 bits for DIP2 tx type
+        if tx_type:
+            version = header & 0x0000ffff
+        else:
+            version = header
+        
+        # Handle case where tx_type is set but version < 3
+        if tx_type and version < 3:
+            version = header
+            tx_type = 0
+        
+        # Read transparent inputs and outputs
+        inputs = self._read_inputs()
+        outputs = self._read_outputs()
+        locktime = self._read_le_uint32()
+        
+        # Initialize Sapling fields
+        value_balance = 0
+        sapling_spends = []
+        sapling_outputs = []
+        binding_sig = b''
+        extra_payload = b''
+        
+        # Parse Sapling components (version >= 3)
+        if version >= 3:
+            # Skip nExpiryHeight (encoded as varint in PIVX)
+            self._read_varint()
+            
+            # Value balance (signed 64-bit, positive = from shielded to transparent)
+            value_balance = self._read_le_int64()
+            
+            # Read shielded spends
+            spend_count = self._read_varint()
+            for _ in range(spend_count):
+                sapling_spends.append(self._read_sapling_spend())
+            
+            # Read shielded outputs
+            output_count = self._read_varint()
+            for _ in range(output_count):
+                sapling_outputs.append(self._read_sapling_output())
+            
+            # Binding signature (64 bytes, only if there are shielded components)
+            if sapling_spends or sapling_outputs:
+                binding_sig = self._read_nbytes(64)
+            
+            # Extra payload for special transaction types
+            if tx_type > 0:
+                payload_size = self._read_varint()
+                if payload_size > 0:
+                    extra_payload = self._read_nbytes(payload_size)
+        
+        return TxPIVXSapling(
+            version,
+            tx_type,
+            inputs,
+            outputs,
+            locktime,
+            value_balance,
+            sapling_spends,
+            sapling_outputs,
+            binding_sig,
+            extra_payload,
+        )
+    
+    def _read_sapling_spend(self):
+        """Read a Sapling spend description (384 bytes)."""
+        return SaplingSpend(
+            cv=self._read_nbytes(32),              # Value commitment
+            anchor=self._read_nbytes(32),          # Merkle tree root
+            nullifier=self._read_nbytes(32),       # Nullifier
+            rk=self._read_nbytes(32),              # Randomized public key
+            zkproof=self._read_nbytes(192),        # Groth16 proof
+            spend_auth_sig=self._read_nbytes(64),  # Spend authorization signature
+        )
+    
+    def _read_sapling_output(self):
+        """Read a Sapling output description (948 bytes)."""
+        return SaplingOutput(
+            cv=self._read_nbytes(32),              # Value commitment
+            cmu=self._read_nbytes(32),             # Note commitment (u-coordinate)
+            ephemeral_key=self._read_nbytes(32),   # Ephemeral public key
+            enc_ciphertext=self._read_nbytes(580), # Encrypted note plaintext
+            out_ciphertext=self._read_nbytes(80),  # Outgoing ciphertext
+            zkproof=self._read_nbytes(192),        # Groth16 proof
+        )

@@ -44,7 +44,7 @@ from lib.script import ScriptPubKey, OpCodes
 import lib.tx as lib_tx
 from server.block_processor import BlockProcessor
 import server.daemon as daemon
-from server.session import ElectrumX, DashElectrumX
+from server.session import ElectrumX, DashElectrumX, PIVXSaplingElectrumX
 
 
 Block = namedtuple("Block", "raw header transactions")
@@ -1610,17 +1610,31 @@ class Pivx(Coin):
      TX_PER_BLOCK = 1
      STATIC_BLOCK_HEADERS = False
      RPC_PORT = 51470
-     ZEROCOIN_HEADER = 112
+     REORG_LIMIT = 100
+     # Header sizes: 80 bytes basic, 112 bytes expanded (Zerocoin/Sapling)
+     EXPANDED_HEADER = 112
      ZEROCOIN_START_HEIGHT = 863787
+     ZEROCOIN_END_HEIGHT = 2153200
      ZEROCOIN_BLOCK_VERSION = 4
-     IRC_PREFIX = "D_"
-     IRC_CHANNEL = "#electrum-pivx"
+     # Sapling activation (PIVX v5.0 upgrade)
+     SAPLING_START_HEIGHT = 2700500
+     # Use the PIVX Sapling deserializer for full Sapling data parsing
+     # (Unlike upstream which skips shielded data, we extract and index it)
+     DESERIALIZER = lib_tx.DeserializerPIVXSapling
+     # Use the Sapling-aware session class for shielded RPC methods
+     SESSIONCLS = PIVXSaplingElectrumX
 
      @classmethod
      def static_header_len(cls, height):
-         '''Given a header height return its length.'''
-         if (height >= cls.ZEROCOIN_START_HEIGHT):
-             return cls.ZEROCOIN_HEADER
+         '''Given a header height return its length.
+         
+         Headers are 112 bytes during Zerocoin era and Sapling era,
+         but 80 bytes in between (gap from ZEROCOIN_END to SAPLING_START).
+         '''
+         if (height >= cls.ZEROCOIN_START_HEIGHT and 
+                 height < cls.ZEROCOIN_END_HEIGHT) or \
+                 height >= cls.SAPLING_START_HEIGHT:
+             return cls.EXPANDED_HEADER
          else:
              return cls.BASIC_HEADER_SIZE
 
@@ -1677,13 +1691,18 @@ class PivxTestnet(Pivx):
      TX_COUNT = 2157510
      TX_PER_BLOCK = 4
      RPC_PORT = 51472
-     IRC_PREFIX = "D_"
-     IRC_CHANNEL = "#electrum-pivx"
+     # Testnet Zerocoin/Sapling heights (per upstream PR #95)
+     ZEROCOIN_START_HEIGHT = 201
+     ZEROCOIN_END_HEIGHT = 201
+     ZEROCOIN_BLOCK_VERSION = 4
+     SAPLING_START_HEIGHT = 201
 
      @classmethod
      def static_header_len(cls, height):
          '''Given a header height return its length.'''
-         if (height >= 201564):
-             return cls.ZEROCOIN_HEADER
+         if (height >= cls.ZEROCOIN_START_HEIGHT and 
+                 height < cls.ZEROCOIN_END_HEIGHT) or \
+                 height >= cls.SAPLING_START_HEIGHT:
+             return cls.EXPANDED_HEADER
          else:
              return cls.BASIC_HEADER_SIZE

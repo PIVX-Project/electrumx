@@ -77,11 +77,13 @@ def test_sapling_reorg_removes_outputs_spends_and_anchors():
 
     db.flush_sapling_data(
         db.utxo_db.put,
-        [(50, 0, kept_cm), (110, 1, removed_cm)],
+        [(50, 0, kept_cm, 149), (110, 1, removed_cm, 150)],
         [(51, 0, kept_nf), (111, 0, removed_nf)],
         [(kept_anchor, 149), (removed_anchor, 150)],
         150,
     )
+    kept_root = DB.sapling_root_from_commitments([kept_cm])
+    removed_root = DB.sapling_root_from_commitments([kept_cm, removed_cm])
 
     deletes = []
     db.backup_sapling_data(100, deletes.append, height_start=150)
@@ -93,6 +95,11 @@ def test_sapling_reorg_removes_outputs_spends_and_anchors():
     assert db.get_commitment_info(removed_cm) is None
     assert db.get_nullifier_spend(removed_nf) is None
     assert db.get_anchor_height(removed_anchor) is None
+    assert db.get_sapling_output_by_position(0).commitment == kept_cm
+    assert db.get_sapling_output_by_position(1) is None
+    assert db.get_sapling_root_info(kept_root) == (1, 149)
+    assert db.get_sapling_root_info(removed_root) is None
+    assert db.sapling_output_count == 1
 
 
 def test_reorg_can_respend_nullifier_on_different_branch():
@@ -183,8 +190,24 @@ def test_client_can_rescan_full_pivx_rollback_boundary_with_hashes():
     assert response['start_height'] == start
     assert response['end_height'] == tip
     assert response['height_count'] == PIVX_SAPLING_MAX_BLOCK_RANGE
+    assert response['block_hashes'] == [
+        {'height': height, 'block_hash': f'{height:064x}'}
+        for height in range(start, tip + 1)
+    ]
     assert response['blocks'] == []
     assert response['error'] is None
+
+    stale_local_hashes = {
+        height: f'{height:064x}'
+        for height in range(start, tip + 1)
+    }
+    stale_local_hashes[start + 7] = 'ff' * 32
+    mismatches = [
+        item['height']
+        for item in response['block_hashes']
+        if stale_local_hashes[item['height']] != item['block_hash']
+    ]
+    assert mismatches == [start + 7]
 
 
 def test_sapling_range_rejects_more_than_rollback_boundary():

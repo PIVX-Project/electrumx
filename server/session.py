@@ -742,7 +742,8 @@ class PIVXSaplingElectrumX(ElectrumX):
 
     @staticmethod
     def _sapling_range_response(start_height, end_height, blocks, complete,
-                                error=None, total_sapling_txs=0):
+                                error=None, total_sapling_txs=0,
+                                block_hashes=None):
         scanned = end_height - start_height + 1
         return {
             'success': complete and error is None,
@@ -754,13 +755,15 @@ class PIVXSaplingElectrumX(ElectrumX):
             'height_count': scanned,
             'block_count': len(blocks),
             'sapling_tx_count': total_sapling_txs,
+            'block_hashes': block_hashes or [],
             'blocks': blocks,
             'error': error,
         }
 
     def _sapling_range_error_response(self, start_height, end_height, blocks,
                                       error_type, message,
-                                      total_sapling_txs=0, **context):
+                                      total_sapling_txs=0, block_hashes=None,
+                                      **context):
         error = {
             'type': error_type,
             'message': message,
@@ -769,7 +772,8 @@ class PIVXSaplingElectrumX(ElectrumX):
                       if value is not None})
         return self._sapling_range_response(start_height, end_height, blocks,
                                             False, error,
-                                            total_sapling_txs)
+                                            total_sapling_txs,
+                                            block_hashes)
 
     def _sapling_block_hash(self, height):
         '''Return the indexed chain block hash at height as hex.'''
@@ -1021,6 +1025,7 @@ class PIVXSaplingElectrumX(ElectrumX):
                          f'heights {start_height}-{end_height}')
 
         blocks = []
+        block_hashes = []
         total_sapling_txs = 0
 
         try:
@@ -1034,8 +1039,13 @@ class PIVXSaplingElectrumX(ElectrumX):
                         start_height, end_height, blocks,
                         'missing_block_hash',
                         'daemon returned no block hash',
-                        total_sapling_txs, height=height,
+                        total_sapling_txs, block_hashes,
+                        height=height,
                         method='getblockhash')
+                block_hashes.append({
+                    'height': height,
+                    'block_hash': block_hash,
+                })
 
                 # Get block with transaction data (verbosity=2 for decoded tx)
                 block = await self.daemon.daemon_request(
@@ -1047,7 +1057,8 @@ class PIVXSaplingElectrumX(ElectrumX):
                         start_height, end_height, blocks,
                         'missing_block',
                         'daemon returned no decoded block transactions',
-                        total_sapling_txs, height=height,
+                        total_sapling_txs, block_hashes,
+                        height=height,
                         block_hash=block_hash, method='getblock')
 
                 # Filter to only transactions with Sapling data
@@ -1068,7 +1079,8 @@ class PIVXSaplingElectrumX(ElectrumX):
                                 start_height, end_height, blocks,
                                 'missing_transaction',
                                 'daemon returned no raw transaction',
-                                total_sapling_txs, height=height,
+                                total_sapling_txs, block_hashes,
+                                height=height,
                                 block_hash=block_hash, txid=txid,
                                 method='getrawtransaction')
 
@@ -1084,7 +1096,8 @@ class PIVXSaplingElectrumX(ElectrumX):
                                     start_height, end_height, blocks,
                                     'index_error',
                                     f'Sapling index lookup failed: {e}',
-                                    total_sapling_txs, height=height,
+                                    total_sapling_txs, block_hashes,
+                                    height=height,
                                     block_hash=block_hash, txid=txid,
                                     tx_index=tx_index,
                                     output_index=output_index,
@@ -1094,7 +1107,8 @@ class PIVXSaplingElectrumX(ElectrumX):
                                     start_height, end_height, blocks,
                                     'index_incomplete',
                                     'Sapling commitment is not indexed',
-                                    total_sapling_txs, height=height,
+                                    total_sapling_txs, block_hashes,
+                                    height=height,
                                     block_hash=block_hash, txid=txid,
                                     tx_index=tx_index,
                                     output_index=output_index,
@@ -1135,17 +1149,19 @@ class PIVXSaplingElectrumX(ElectrumX):
                               f'{error["message"]}')
             return self._sapling_range_response(start_height, end_height,
                                                 blocks, False, error,
-                                                total_sapling_txs)
+                                                total_sapling_txs,
+                                                block_hashes)
         except Exception as e:
             self.logger.exception(f'sapling get_block_range: index error: {e}')
             return self._sapling_range_error_response(
                 start_height, end_height, blocks, 'server_error', str(e),
-                total_sapling_txs)
+                total_sapling_txs, block_hashes)
 
         self.logger.info(f'sapling get_block_range: returning {len(blocks)} '
                          f'blocks with {total_sapling_txs} sapling txs')
         return self._sapling_range_response(start_height, end_height, blocks,
-                                            True, None, total_sapling_txs)
+                                            True, None, total_sapling_txs,
+                                            block_hashes)
 
     async def sapling_get_anchor_height(self, anchor_hex):
         '''Get the block height where a Sapling anchor was valid.

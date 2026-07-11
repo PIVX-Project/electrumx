@@ -194,7 +194,8 @@ def make_special_tx(tx_type, payload, sapdata_present=True,
     if sapdata_present:
         tx += b'\x01'                   # sapData present
         tx += struct.pack('<q', 0)      # valueBalance
-        tx += b'\x00\x00'               # no spends/outputs, no bindingSig
+        tx += b'\x00\x00'               # no spends/outputs
+        tx += b'\x00' * 64          # bindingSig, always present
     else:
         tx += b'\x00'                   # sapData absent
     if payload_present:
@@ -273,3 +274,33 @@ class TestPivxElectrumHeader:
         assert 'acc_checkpoint' not in h
         assert 'final_sapling_root' not in h
         assert h['version'] == 7
+
+
+class TestRealTransparentV3Tx:
+    """Regression for mainnet tx 2d356c83... (block 2,981,155): a v3
+    transparent tx whose empty SaplingTxData still carries the 64-byte
+    all-zero bindingSig (PIVX serializes it unconditionally, unlike
+    Zcash)."""
+
+    RAW_HEX = (
+        '03000000010d645269c674db34c89d15536d5b81fcd2ef223c57a8a882'
+        '65ff069727338cf4000000006a473044022028fe6728d6f9ad3f6e97da'
+        '7c9c5e1981d2f0a319ada6cbcdbc27f332d4fd6ffa0220063523015a6e'
+        '0577134874391ca562403720c5231682324786b0f2a8afaa438b012102'
+        '347381b756c52be48cb06245609bef2c6be21ec82ae563f3ad03f66904'
+        '43e050ffffffff0240e31c59020000001976a914151d67e095843000f6'
+        '970cd04a3222cf348a194188acb0bae400000000001976a91492dcf18f'
+        'f36591719d7ad6b741513af52975d93888ac0000000001000000000000'
+        '0000000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000'
+        '00000000000000000000'
+    )
+
+    def test_txid_and_full_consumption(self):
+        raw = bytes.fromhex(self.RAW_HEX)
+        deser = lib_tx.DeserializerPIVXSapling(raw)
+        tx = deser.read_tx()
+        assert deser.cursor == len(raw)
+        assert tx.version == 3
+        assert tx.tx_type == 0
+        assert not tx.has_sapling

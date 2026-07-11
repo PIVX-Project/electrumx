@@ -177,6 +177,15 @@ class Daemon(object):
             payload['params'] = params
         return await self._send(payload, processor)
 
+    async def daemon_request(self, method, params=None):
+        '''Send a raw JSON-RPC request to the daemon.
+
+        Most ElectrumX code calls typed daemon wrapper methods.  Some
+        coin-specific RPCs need decoded daemon responses that do not have a
+        generic wrapper, so expose a narrow public passthrough for those.
+        '''
+        return await self._send_single(method, params)
+
     async def _send_vector(self, method, params_iterable, replace_errs=False):
         '''Send several requests of the same method.
 

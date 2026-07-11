@@ -600,15 +600,22 @@ class PIVXSaplingElectrumX(ElectrumX):
     Sapling operations including:
       - Commitment tree management
       - Note decryption using viewing keys
-      - Witness generation for spending
       - Nullifier computation and tracking
 
     Key Design Principles:
-      - Server indexes nullifiers and commitments for lookup
+      - Server indexes nullifiers, commitments, global output positions
+        and consensus anchors (finalsaplingroot from block headers)
       - Server does NOT have access to viewing keys
       - Client performs trial decryption of notes
-      - Client maintains commitment tree and witnesses locally
+      - Client maintains the commitment tree and computes witnesses
+        locally: valid witnesses need the Sapling Pedersen-hash tree,
+        which this index cannot serve.  get_tree_state provides the
+        consensus anchor and tree size to verify the local tree against
       - Raw transaction hex is provided for client-side parsing
+      - All 32-byte values (nullifiers, commitments, anchors, hashes)
+        are hex strings in PIVX Core RPC display byte order
+      - Responses are served from the server's indexed chain, never
+        mixed with a diverging daemon tip
     '''
 
     def set_protocol_handlers(self, ptuple):
@@ -639,7 +646,13 @@ class PIVXSaplingElectrumX(ElectrumX):
                 self.sapling_get_block_range,
             'blockchain.sapling.get_blocks':
                 self.sapling_get_block_range,
+            'get_block_range':
+                self.sapling_get_block_range,
+            'sapling.get_block_range':
+                self.sapling_get_block_range,
             'blockchain.sapling.get_anchor_height':
+                self.sapling_get_anchor_height,
+            'blockchain.anchor.get_height':
                 self.sapling_get_anchor_height,
             'blockchain.sapling.get_best_anchor':
                 self.sapling_get_best_anchor,
@@ -653,20 +666,52 @@ class PIVXSaplingElectrumX(ElectrumX):
                 self.sapling_get_witness,
             'blockchain.sapling.get_witnesses':
                 self.sapling_get_witnesses,
+            'blockchain.nullifier.get_spend':
+                self.sapling_get_nullifier_status,
+            'blockchain.commitment.get_info':
+                self.sapling_get_commitment_info,
         })
 
-    def sapling_capabilities(self):
+    @staticmethod
+    def _format_daemon_version(version):
+        if version is None:
+            return None
+        major, minor = divmod(version, 1000000)
+        minor, revision = divmod(minor, 10000)
+        revision //= 100
+        return '{:d}.{:d}.{:d}'.format(major, minor, revision)
+
+    async def _sapling_daemon_version_info(self):
+        try:
+            network_info = await self.daemon.daemon_request(
+                'getnetworkinfo', [])
+        except Exception as e:
+            self.logger.debug(f'sapling capabilities: daemon version '
+                              f'unavailable: {e}')
+            return {
+                'pivx_core_version': None,
+                'pivx_core_version_number': None,
+                'pivx_core_subversion': None,
+            }
+        version = network_info.get('version')
+        return {
+            'pivx_core_version': self._format_daemon_version(version),
+            'pivx_core_version_number': version,
+            'pivx_core_subversion': network_info.get('subversion'),
+        }
+
+    async def sapling_capabilities(self):
         '''Return the PIVX Sapling ElectrumX v1 RPC contract.'''
         primary_methods = [
             'blockchain.sapling.capabilities',
             'blockchain.sapling.get_block_range',
             'blockchain.sapling.get_nullifier_status',
+            'blockchain.sapling.check_nullifiers',
             'blockchain.sapling.get_commitment_info',
+            'blockchain.sapling.get_outputs_by_height',
             'blockchain.sapling.get_best_anchor',
             'blockchain.sapling.get_anchor_height',
             'blockchain.sapling.get_tree_state',
-            'blockchain.sapling.get_witness',
-            'blockchain.sapling.get_witnesses',
         ]
         aliases = {
             'blockchain.sapling.capabilities': [
@@ -675,13 +720,17 @@ class PIVXSaplingElectrumX(ElectrumX):
             ],
             'blockchain.sapling.get_block_range': [
                 'blockchain.sapling.get_blocks',
+                'get_block_range',
+                'sapling.get_block_range',
             ],
             'blockchain.sapling.get_nullifier_status': [
                 'blockchain.sapling.check_nullifier',
+                'blockchain.nullifier.get_spend',
             ],
             'blockchain.sapling.check_nullifiers': [],
             'blockchain.sapling.get_commitment_info': [
                 'blockchain.sapling.get_commitment',
+                'blockchain.commitment.get_info',
             ],
             'blockchain.sapling.get_outputs_by_height': [
                 'blockchain.sapling.get_outputs',
@@ -689,26 +738,56 @@ class PIVXSaplingElectrumX(ElectrumX):
             'blockchain.sapling.get_best_anchor': [
                 'blockchain.sapling.best_anchor',
             ],
+            'blockchain.sapling.get_anchor_height': [
+                'blockchain.anchor.get_height',
+            ],
             'blockchain.sapling.get_tree_state': [
                 'blockchain.sapling.get_treestate',
             ],
         }
         activation_height = getattr(self.controller.coin,
                                     'SAPLING_START_HEIGHT', None)
+        server_version = getattr(self.controller, 'VERSION', None)
+        server_short_version = None
+        short_version = getattr(self.controller, 'short_version', None)
+        if callable(short_version):
+            server_short_version = short_version()
+        elif server_version:
+            server_short_version = server_version.split()[-1]
+        daemon_version_info = await self._sapling_daemon_version_info()
         return {
             'success': True,
             'contract': PIVX_SAPLING_RPC_CONTRACT,
             'version': 1,
+            'server_version': server_version,
+            'server_short_version': server_short_version,
+            **daemon_version_info,
             'coin': getattr(self.controller.coin, 'SHORTNAME', 'PIVX'),
             'network': getattr(self.controller.coin, 'NET', None),
             'sapling_activation_height': activation_height,
+            'reorg_limit': getattr(self.controller.coin, 'REORG_LIMIT', None),
             'max_block_range': PIVX_SAPLING_MAX_BLOCK_RANGE,
             'range_response': 'envelope',
+            'response_order': 'ascending_height',
+            'output_order': 'pivx_core_block_transaction_vshieldoutput',
+            'includes_global_output_positions': True,
+            'block_hashes': True,
+            'structured_errors': True,
+            # Server-side witnesses are not provided: a valid Sapling
+            # witness requires the Pedersen-hash note commitment tree,
+            # which clients build locally from the ordered commitment
+            # stream.  The server instead provides consensus anchors
+            # (finalsaplingroot from block headers) with the tree size
+            # at which each root formed.
+            'anchor_bound_witnesses': False,
+            'server_side_witnesses': False,
+            'consensus_anchors': True,
+            'anchor_tree_size': True,
+            'hex_byte_order': 'display',
             'range_error_types': [
                 'invalid_range',
                 'daemon_error',
                 'method_unavailable',
-                'missing_block_hash',
                 'missing_block',
                 'missing_transaction',
                 'index_incomplete',
@@ -787,43 +866,35 @@ class PIVXSaplingElectrumX(ElectrumX):
             return hash_to_str(block_hashes[0])
         return None
 
-    def _sapling_commitment_position(self, commitment_hex):
-        '''Return a commitment's indexed global Sapling output position.'''
+    def _parse_sapling_hex32(self, value, what):
+        '''Parse a 64-character display-order hex string to the raw
+        little-endian 32 bytes used as index keys.'''
         try:
-            commitment = bytes.fromhex(commitment_hex)
+            raw = bytes.fromhex(value)
+            if len(raw) != 32:
+                raise ValueError(f'{what} must be 32 bytes')
+        except (TypeError, ValueError) as e:
+            self.logger.warning(f'sapling: invalid {what}: {e}')
+            raise RPCError(BAD_REQUEST, f'invalid {what}: {e}')
+        return raw[::-1]
+
+    def _sapling_commitment_position(self, commitment_hex):
+        '''Return a commitment's indexed global Sapling output position.
+
+        commitment_hex is in display byte order.'''
+        try:
+            commitment = bytes.fromhex(commitment_hex)[::-1]
             if len(commitment) != 32:
                 return None
-        except ValueError:
+        except (TypeError, ValueError):
             return None
-        if self.bp is None:
-            return None
-        info = self.bp.get_commitment_position_info(commitment)
-        return None if info is None else info.position
+        return self.bp.get_commitment_position(commitment)
 
-    async def sapling_get_nullifier_status(self, nullifier_hex):
-        '''Check if a Sapling nullifier has been spent.
-
-        nullifier_hex: the nullifier as a 64-character hex string
-
-        Returns a dict with:
-          - spent: boolean indicating if spent
-          - tx_hash: spending transaction hash (if spent)
-          - height: block height (if spent)
-          - block_hash: block hash at height (if spent)
-          - spend_index: index in spending tx's vShieldedSpend (if spent)
-        '''
-        try:
-            nullifier = bytes.fromhex(nullifier_hex)
-            if len(nullifier) != 32:
-                raise ValueError('nullifier must be 32 bytes')
-        except ValueError as e:
-            self.logger.warning(f'sapling nullifier status: invalid input: {e}')
-            raise RPCError(BAD_REQUEST, f'invalid nullifier: {e}')
-
+    def _nullifier_status(self, nullifier):
+        '''Synchronous spend-status lookup for a raw nullifier.'''
         result = self.bp.get_nullifier_spend(nullifier)
         if result:
             tx_hash, height, spend_index = result
-            self.logger.debug(f'sapling nullifier spent at height {height}')
             return {
                 'spent': True,
                 'tx_hash': hash_to_str(tx_hash),
@@ -832,6 +903,23 @@ class PIVXSaplingElectrumX(ElectrumX):
                 'spend_index': spend_index,
             }
         return {'spent': False}
+
+    async def sapling_get_nullifier_status(self, nullifier_hex):
+        '''Check if a Sapling nullifier has been spent.
+
+        nullifier_hex: the nullifier as a 64-character display-order
+        hex string
+
+        Returns a dict with:
+          - spent: boolean indicating if spent
+          - tx_hash: spending transaction hash (if spent)
+          - height: block height (if spent)
+          - block_hash: block hash at height (if spent)
+          - spend_index: index in spending tx's vShieldedSpend (if spent)
+        '''
+        nullifier = self._parse_sapling_hex32(nullifier_hex, 'nullifier')
+        return await self.controller.run_in_executor(
+            self._nullifier_status, nullifier)
 
     async def sapling_check_nullifiers(self, nullifiers):
         '''Check spend status for multiple Sapling nullifiers.'''
@@ -842,10 +930,16 @@ class PIVXSaplingElectrumX(ElectrumX):
         if len(nullifiers) > 1000:
             raise RPCError(BAD_REQUEST,
                            'cannot request more than 1000 nullifiers')
-        results = {}
-        for nullifier_hex in nullifiers:
-            results[nullifier_hex] = await self.sapling_get_nullifier_status(
-                nullifier_hex)
+        parsed = [(nullifier_hex,
+                   self._parse_sapling_hex32(nullifier_hex, 'nullifier'))
+                  for nullifier_hex in nullifiers]
+
+        def job():
+            return {nullifier_hex: self._nullifier_status(nullifier)
+                    for nullifier_hex, nullifier in parsed}
+
+        # Up to 1000 DB and file lookups; keep them off the event loop
+        results = await self.controller.run_in_executor(job)
         return {
             'success': True,
             'contract': PIVX_SAPLING_RPC_CONTRACT,
@@ -855,37 +949,33 @@ class PIVXSaplingElectrumX(ElectrumX):
     async def sapling_get_commitment_info(self, commitment_hex):
         '''Get information about a Sapling note commitment.
 
-        commitment_hex: the commitment (cmu) as a 64-character hex string
+        commitment_hex: the commitment (cmu) as a 64-character
+        display-order hex string
 
         Returns a dict with:
           - found: boolean indicating if found
           - tx_hash: creating transaction hash (if found)
           - height: block height (if found)
           - block_hash: block hash at height (if found)
+          - position: global Sapling output position (if found)
           - output_index: index in creating tx's vShieldedOutput (if found)
         '''
-        try:
-            commitment = bytes.fromhex(commitment_hex)
-            if len(commitment) != 32:
-                raise ValueError('commitment must be 32 bytes')
-        except ValueError as e:
-            self.logger.warning(f'sapling commitment info: invalid input: {e}')
-            raise RPCError(BAD_REQUEST, f'invalid commitment: {e}')
+        commitment = self._parse_sapling_hex32(commitment_hex, 'commitment')
 
-        result = self.bp.get_commitment_info(commitment)
-        if result:
-            tx_hash, height, output_index = result
-            self.logger.debug(f'sapling commitment found at height {height}')
-            return {
-                'found': True,
-                'tx_hash': hash_to_str(tx_hash),
-                'height': height,
-                'block_hash': self._sapling_block_hash(height),
-                'position': self._sapling_commitment_position(
-                    commitment_hex),
-                'output_index': output_index,
-            }
-        return {'found': False}
+        def job():
+            info = self.bp.get_commitment_position_info(commitment)
+            if info:
+                return {
+                    'found': True,
+                    'tx_hash': hash_to_str(info.tx_hash),
+                    'height': info.height,
+                    'block_hash': self._sapling_block_hash(info.height),
+                    'position': info.position,
+                    'output_index': info.output_index,
+                }
+            return {'found': False}
+
+        return await self.controller.run_in_executor(job)
 
     async def sapling_get_outputs_by_height(self, start_height,
                                             end_height=None, limit=1000):
@@ -921,12 +1011,19 @@ class PIVXSaplingElectrumX(ElectrumX):
         if end_height - start_height + 1 > PIVX_SAPLING_MAX_BLOCK_RANGE:
             raise RPCError(BAD_REQUEST,
                            'height range must not exceed 100 blocks')
+        indexed_height = self.bp.db_height
+        if end_height > indexed_height:
+            raise RPCError(BAD_REQUEST,
+                           f'range extends above indexed tip '
+                           f'{indexed_height:,d}')
 
         limit = self.controller.non_negative_integer(limit)
-        limit = min(limit, 5000)  # Cap at 5000
+        if limit > 5000:
+            raise RPCError(BAD_REQUEST, 'limit must not exceed 5000')
 
-        self.logger.info(f'sapling get_outputs_by_height: '
-                         f'heights {start_height}-{end_height}, limit={limit}')
+        self.logger.debug(f'sapling get_outputs_by_height: '
+                          f'heights {start_height}-{end_height}, '
+                          f'limit={limit}')
 
         outputs = []
         count = 0
@@ -936,18 +1033,20 @@ class PIVXSaplingElectrumX(ElectrumX):
                 if count >= limit:
                     break
 
-                # Get block hash for this height
-                block_hash = await self.daemon.daemon_request(
-                    'getblockhash', [height])
+                # The indexed chain is canonical: fetch the exact block
+                # our index processed, never a diverging daemon tip
+                block_hash = self._sapling_block_hash(height)
                 if not block_hash:
-                    self.logger.debug(f'sapling: no block hash for {height}')
-                    continue
+                    raise RPCError(BAD_REQUEST,
+                                   f'no indexed block hash at {height:,d}')
 
-                # Get block with transaction data
+                # Get block with transaction data (verbosity=2)
                 block = await self.daemon.daemon_request(
-                    'getblock', [block_hash, 2])  # verbosity=2 for full tx data
+                    'getblock', [block_hash, 2])
                 if not block or 'tx' not in block:
-                    continue
+                    raise RPCError(DAEMON_ERROR,
+                                   f'daemon returned no decoded block '
+                                   f'for {height:,d}')
 
                 for tx_data in block['tx']:
                     if count >= limit:
@@ -959,28 +1058,36 @@ class PIVXSaplingElectrumX(ElectrumX):
                     for idx, out in enumerate(vShieldOut):
                         if count >= limit:
                             break
+                        cmu = out.get('cmu', '')
+                        position = self._sapling_commitment_position(cmu)
+                        if position is None:
+                            # Heights at or below db_height must be
+                            # fully indexed; never serve outputs whose
+                            # global position is unknown
+                            raise RPCError(
+                                BAD_REQUEST,
+                                f'Sapling commitment {cmu} at height '
+                                f'{height:,d} is not indexed')
                         outputs.append({
                             'tx_hash': tx_hash,
                             'height': height,
                             'block_hash': block_hash,
-                            'position': self._sapling_commitment_position(
-                                out.get('cmu', '')),
+                            'position': position,
                             'output_index': idx,
-                            'cmu': out.get('cmu', ''),
+                            'cmu': cmu,
                             'ephemeral_key': out.get('ephemeralKey', ''),
                             'enc_ciphertext': out.get('encCiphertext', ''),
                             'out_ciphertext': out.get('outCiphertext', ''),
                         })
                         count += 1
         except DaemonError as e:
-            error, = e.args
-            message = error.get('message', str(error))
+            error = self._sapling_daemon_error(e)
             self.logger.error(f'sapling get_outputs_by_height: '
-                              f'daemon error: {message}')
-            raise RPCError(DAEMON_ERROR, f'daemon error: {message}')
+                              f'daemon error: {error["message"]}')
+            raise RPCError(DAEMON_ERROR, f'daemon error: {error["message"]}')
 
-        self.logger.info(f'sapling get_outputs_by_height: '
-                         f'returning {len(outputs)} outputs')
+        self.logger.debug(f'sapling get_outputs_by_height: '
+                          f'returning {len(outputs)} outputs')
         return outputs
 
     async def sapling_get_block_range(self, start_height, end_height=None):
@@ -1007,7 +1114,12 @@ class PIVXSaplingElectrumX(ElectrumX):
                 display_start = int(start_height)
             except Exception:
                 display_start = 0
-            display_end = display_start if end_height is None else display_start
+            display_end = display_start
+            if end_height is not None:
+                try:
+                    display_end = int(end_height)
+                except Exception:
+                    pass
             return self._sapling_range_error_response(
                 display_start, display_end, [], 'invalid_range', e.message)
 
@@ -1020,9 +1132,15 @@ class PIVXSaplingElectrumX(ElectrumX):
                 start_height, end_height, [], 'invalid_range',
                 'height range must not exceed 100 blocks',
                 max_block_range=PIVX_SAPLING_MAX_BLOCK_RANGE)
+        indexed_height = self.bp.db_height
+        if end_height > indexed_height:
+            return self._sapling_range_error_response(
+                start_height, end_height, [], 'index_incomplete',
+                'range extends above indexed tip',
+                indexed_height=indexed_height)
 
-        self.logger.info(f'sapling get_block_range: '
-                         f'heights {start_height}-{end_height}')
+        self.logger.debug(f'sapling get_block_range: '
+                          f'heights {start_height}-{end_height}')
 
         blocks = []
         block_hashes = []
@@ -1030,18 +1148,18 @@ class PIVXSaplingElectrumX(ElectrumX):
 
         try:
             for height in range(start_height, end_height + 1):
-                # Get block hash for this height
-                block_hash = await self.daemon.daemon_request(
-                    'getblockhash', [height])
+                # The indexed chain is canonical: fetch the exact block
+                # our index processed, never a diverging daemon tip
+                block_hash = self._sapling_block_hash(height)
                 if not block_hash:
-                    self.logger.warning(f'sapling: no block hash for {height}')
+                    self.logger.warning(f'sapling: no indexed block hash '
+                                        f'for {height}')
                     return self._sapling_range_error_response(
                         start_height, end_height, blocks,
-                        'missing_block_hash',
-                        'daemon returned no block hash',
+                        'index_error',
+                        'no indexed block hash',
                         total_sapling_txs, block_hashes,
-                        height=height,
-                        method='getblockhash')
+                        height=height)
                 block_hashes.append({
                     'height': height,
                     'block_hash': block_hash,
@@ -1070,10 +1188,13 @@ class PIVXSaplingElectrumX(ElectrumX):
                     has_output = len(tx_data.get('vShieldOutput', [])) > 0
 
                     if has_spend or has_output:
-                        # Get raw transaction hex
                         txid = tx_data.get('txid', '')
-                        tx_hex = await self.daemon.daemon_request(
-                            'getrawtransaction', [txid])
+                        # getblock verbosity=2 includes each tx's hex;
+                        # fall back to getrawtransaction if absent
+                        tx_hex = tx_data.get('hex')
+                        if not tx_hex:
+                            tx_hex = await self.daemon.daemon_request(
+                                'getrawtransaction', [txid])
                         if not tx_hex:
                             return self._sapling_range_error_response(
                                 start_height, end_height, blocks,
@@ -1157,185 +1278,133 @@ class PIVXSaplingElectrumX(ElectrumX):
                 start_height, end_height, blocks, 'server_error', str(e),
                 total_sapling_txs, block_hashes)
 
-        self.logger.info(f'sapling get_block_range: returning {len(blocks)} '
-                         f'blocks with {total_sapling_txs} sapling txs')
+        self.logger.debug(f'sapling get_block_range: returning {len(blocks)} '
+                          f'blocks with {total_sapling_txs} sapling txs')
         return self._sapling_range_response(start_height, end_height, blocks,
                                             True, None, total_sapling_txs,
                                             block_hashes)
 
     async def sapling_get_anchor_height(self, anchor_hex):
-        '''Get the block height where a Sapling anchor was valid.
+        '''Get the first block height a Sapling anchor appeared at.
 
-        anchor_hex: the anchor (root) as a 64-character hex string
+        anchor_hex: the anchor (consensus finalsaplingroot) as a
+        64-character display-order hex string
 
-        Returns the block height or null if not found.
+        Returns the block height or null if not indexed.
         '''
-        try:
-            anchor = bytes.fromhex(anchor_hex)
-            if len(anchor) != 32:
-                raise ValueError('anchor must be 32 bytes')
-        except ValueError as e:
-            self.logger.warning(f'sapling anchor height: invalid input: {e}')
-            raise RPCError(BAD_REQUEST, f'invalid anchor: {e}')
-
-        height = self.bp.get_anchor_height(anchor)
-        if height is not None:
-            self.logger.debug(f'sapling anchor found at height {height}')
-        return height
+        anchor = self._parse_sapling_hex32(anchor_hex, 'anchor')
+        return self.bp.get_anchor_height(anchor)
 
     async def sapling_get_tree_state(self, height=None):
         '''Return Sapling tree state metadata for an indexed height.
 
-        The anchor/root is the PIVX Core final Sapling root reported in the
-        decoded block.  tree_size is present when the local Sapling index has a
-        matching root entry; otherwise it is null because Core does not expose
-        it in getblock output.
+        The anchor/root is the consensus finalsaplingroot from the
+        indexed block header at that height.  tree_size is the number
+        of note commitments in the tree when that root formed, letting
+        a client bound and verify its locally built commitment tree.
         '''
         if height is None:
             height = self.bp.db_height
         else:
             height = self.controller.non_negative_integer(height)
 
-        indexed_height = self.bp.db_height
-        if height > indexed_height:
-            return {
-                'success': False,
-                'contract': PIVX_SAPLING_RPC_CONTRACT,
-                'error': {
-                    'type': 'index_incomplete',
-                    'message': 'requested height is above indexed tip',
-                    'height': height,
-                    'indexed_height': indexed_height,
-                },
-            }
-
-        try:
-            block_hash = await self.daemon.daemon_request(
-                'getblockhash', [height])
-            if not block_hash:
-                return {
-                    'success': False,
-                    'contract': PIVX_SAPLING_RPC_CONTRACT,
-                    'error': {
-                        'type': 'missing_block_hash',
-                        'message': 'daemon returned no block hash',
-                        'height': height,
-                        'method': 'getblockhash',
-                    },
-                }
-            block = await self.daemon.daemon_request(
-                'getblock', [block_hash, 2])
-            if not block:
-                return {
-                    'success': False,
-                    'contract': PIVX_SAPLING_RPC_CONTRACT,
-                    'error': {
-                        'type': 'missing_block',
-                        'message': 'daemon returned no decoded block',
-                        'height': height,
-                        'block_hash': block_hash,
-                        'method': 'getblock',
-                    },
-                }
-        except DaemonError as e:
-            error = self._sapling_daemon_error(e)
-            error.update({'height': height})
+        def error_response(error_type, message, **context):
+            error = {'type': error_type, 'message': message,
+                     'height': height}
+            error.update(context)
             return {
                 'success': False,
                 'contract': PIVX_SAPLING_RPC_CONTRACT,
                 'error': error,
             }
 
-        root = (block.get('finalsaplingroot') or
-                block.get('finalSaplingRoot') or
-                block.get('saplingroot'))
-        tree_size = None
-        if root:
-            try:
-                root_info = self.bp.get_sapling_root_info(
-                    bytes.fromhex(root))
-            except Exception:
-                root_info = None
-            if root_info is not None:
-                tree_size, _root_height = root_info
+        indexed_height = self.bp.db_height
+        if height > indexed_height:
+            return error_response('index_incomplete',
+                                  'requested height is above indexed tip',
+                                  indexed_height=indexed_height)
+        activation = getattr(self.controller.coin,
+                             'SAPLING_START_HEIGHT', None)
+        if activation is None or height < activation:
+            return error_response('invalid_range',
+                                  'requested height is below Sapling '
+                                  'activation',
+                                  sapling_activation_height=activation)
 
-        return {
-            'success': True,
-            'contract': PIVX_SAPLING_RPC_CONTRACT,
-            'height': height,
-            'block_hash': block_hash,
-            'anchor': root,
-            'root': root,
-            'tree_size': tree_size,
-            'indexed_height': indexed_height,
-            'sapling_activation_height': getattr(
-                self.controller.coin, 'SAPLING_START_HEIGHT', None),
-        }
+        def job():
+            root = self.bp.get_sapling_root(height)
+            if root is None:
+                return error_response('index_error',
+                                      'no Sapling root in indexed header')
+            anchor_info = self.bp.get_sapling_anchor_info(root)
+            if anchor_info is None:
+                return error_response('index_incomplete',
+                                      'Sapling root is not indexed')
+            first_height, tree_size = anchor_info
 
-    async def sapling_get_witness(self, position, anchor_hex=None):
-        '''Return an anchor-bound witness for a Sapling note position.
-
-        position: global Sapling output position
-        anchor_hex: indexed root to bind the witness to. If omitted, the
-                    current indexed root is used.
-
-        Returns a dict with:
-          - anchor/root: indexed commitment tree root
-          - anchor_height: height where the root was indexed
-          - position: note position
-          - path: sibling path from note to root
-          - commitment: note commitment at position
-        '''
-        position = self.controller.non_negative_integer(position)
-        anchor = None
-        if anchor_hex is not None:
-            try:
-                anchor = bytes.fromhex(anchor_hex)
-                if len(anchor) != 32:
-                    raise ValueError('anchor must be 32 bytes')
-            except ValueError as e:
-                self.logger.warning(f'sapling witness: invalid anchor: {e}')
-                raise RPCError(BAD_REQUEST, f'invalid anchor: {e}')
-
-        result = self.bp.get_sapling_witness(position, anchor)
-        if result is None:
-            raise RPCError(BAD_REQUEST, 'witness not found for position '
-                           f'{position}')
-        return result
-
-    async def sapling_get_witnesses(self, positions, anchor_hex=None):
-        '''Return anchor-bound witnesses for multiple Sapling note positions.'''
-        if not isinstance(positions, list):
-            raise RPCError(BAD_REQUEST, 'positions must be a list')
-        if len(positions) > 100:
-            raise RPCError(BAD_REQUEST,
-                           'cannot request more than 100 witnesses')
-        return [await self.sapling_get_witness(position, anchor_hex)
-                for position in positions]
-
-    async def sapling_get_best_anchor(self):
-        '''Get the current best (most recent) Sapling tree anchor.
-
-        Returns a dict with:
-          - anchor: the current tree root as a 64-character hex string
-          - height: the current block height
-          - block_hash: current indexed tip hash
-
-        This is equivalent to the PIVX Core getbestsaplinganchor RPC.
-        '''
-        try:
-            anchor = await self.daemon.daemon_request(
-                'getbestsaplinganchor', [])
-            height = self.bp.db_height
-            self.logger.debug(f'sapling best anchor at height {height}')
+            root_hex = hash_to_str(root)
             return {
-                'anchor': anchor,
+                'success': True,
+                'contract': PIVX_SAPLING_RPC_CONTRACT,
                 'height': height,
                 'block_hash': self._sapling_block_hash(height),
+                'anchor': root_hex,
+                'root': root_hex,
+                'anchor_first_height': first_height,
+                'tree_size': tree_size,
+                'indexed_height': indexed_height,
+                'sapling_activation_height': activation,
             }
-        except DaemonError as e:
-            error, = e.args
-            message = error.get('message', str(error))
-            self.logger.error(f'sapling get_best_anchor: '
-                              f'daemon error: {message}')
-            raise RPCError(DAEMON_ERROR, f'daemon error: {message}')
+
+        return await self.controller.run_in_executor(job)
+
+    async def sapling_get_witness(self, position=None, anchor_hex=None):
+        '''Server-side Sapling witnesses are not supported.
+
+        A valid witness requires the Sapling Pedersen-hash note
+        commitment tree.  Clients build the tree locally from the
+        ordered commitment stream (get_block_range global positions)
+        and compute witnesses themselves; get_tree_state supplies the
+        consensus anchor and tree size to verify against.
+        '''
+        raise RPCError(BAD_REQUEST,
+                       'server-side witnesses are not supported; build the '
+                       'commitment tree client-side from global output '
+                       'positions and verify it against get_tree_state '
+                       'anchors')
+
+    async def sapling_get_witnesses(self, positions=None, anchor_hex=None):
+        '''Server-side Sapling witnesses are not supported.'''
+        return await self.sapling_get_witness(positions, anchor_hex)
+
+    async def sapling_get_best_anchor(self):
+        '''Get the best Sapling anchor on the indexed chain.
+
+        Returns a dict with:
+          - anchor: finalsaplingroot of the indexed tip (display hex)
+          - height: the indexed tip height
+          - block_hash: indexed tip hash
+          - tree_size: note commitment count at the anchor
+        '''
+        def job():
+            height = self.bp.db_height
+            root = self.bp.get_sapling_root(height)
+            if root is None:
+                raise RPCError(BAD_REQUEST,
+                               'no Sapling anchor: indexed chain has not '
+                               'reached Sapling activation')
+            anchor_info = self.bp.get_sapling_anchor_info(root)
+            if anchor_info is None:
+                # The tip root must be indexed; a miss means the anchor
+                # index is incomplete and the anchor is not usable
+                raise RPCError(BAD_REQUEST,
+                               'Sapling anchor index is incomplete; the '
+                               'server needs a resync')
+            return {
+                'anchor': hash_to_str(root),
+                'height': height,
+                'block_hash': self._sapling_block_hash(height),
+                'tree_size': anchor_info[1],
+            }
+
+        return await self.controller.run_in_executor(job)

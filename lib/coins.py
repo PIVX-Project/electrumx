@@ -1616,8 +1616,10 @@ class Pivx(Coin):
      ZEROCOIN_START_HEIGHT = 863787
      ZEROCOIN_END_HEIGHT = 2153200
      ZEROCOIN_BLOCK_VERSION = 4
-     # Sapling activation (PIVX v5.0 upgrade)
+     # Sapling activation (PIVX v5.0 upgrade); v8+ block headers carry
+     # hashFinalSaplingRoot in bytes 80:112
      SAPLING_START_HEIGHT = 2700500
+     SAPLING_BLOCK_VERSION = 8
      # Use the PIVX Sapling deserializer for full Sapling data parsing
      # (Unlike upstream which skips shielded data, we extract and index it)
      DESERIALIZER = lib_tx.DeserializerPIVXSapling
@@ -1653,28 +1655,26 @@ class Pivx(Coin):
          version, = struct.unpack('<I', header[:4])
          timestamp, bits, nonce = struct.unpack('<III', header[68:80])
 
-
-         if (version >= cls.ZEROCOIN_BLOCK_VERSION):
-             return {
-                 'block_height': height,
-                 'version': version,
-                 'prev_block_hash': hash_to_str(header[4:36]),
-                 'merkle_root': hash_to_str(header[36:68]),
-                 'timestamp': timestamp,
-                 'bits': bits,
-                 'nonce': nonce,
-                 'acc_checkpoint': hash_to_str(header[80:112])
-             }
-         else:
-             return {
-                 'block_height': height,
-                 'version': version,
-                 'prev_block_hash': hash_to_str(header[4:36]),
-                 'merkle_root': hash_to_str(header[36:68]),
-                 'timestamp': timestamp,
-                 'bits': bits,
-                 'nonce': nonce,
-             }
+         h = {
+             'block_height': height,
+             'version': version,
+             'prev_block_hash': hash_to_str(header[4:36]),
+             'merkle_root': hash_to_str(header[36:68]),
+             'timestamp': timestamp,
+             'bits': bits,
+             'nonce': nonce,
+         }
+         # Decide extra fields by actual header size: 80-byte headers
+         # (pre-Zerocoin and the Zerocoin-to-Sapling gap) carry neither.
+         # Expanded headers carry the accumulator checkpoint in the
+         # Zerocoin era and the final Sapling root from v8 onwards.
+         if len(header) >= cls.EXPANDED_HEADER:
+             extra = hash_to_str(header[80:112])
+             if version >= cls.SAPLING_BLOCK_VERSION:
+                 h['final_sapling_root'] = extra
+             else:
+                 h['acc_checkpoint'] = extra
+         return h
 
 
 class PivxTestnet(Pivx):

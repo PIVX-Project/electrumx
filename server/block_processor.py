@@ -178,6 +178,12 @@ class BlockProcessor(server.db.DB):
         self.utxo_cache = {}
         self.db_deletes = []
 
+        # Sapling shielded data cache, flushed atomically with the
+        # UTXOs.  _last_sapling_root tracks the most recent header root
+        # so only first appearances are recorded as anchors.
+        self.sapling_cache = {'adds': [], 'spends': [], 'anchors': []}
+        self._last_sapling_root = None
+
         self.prefetcher = Prefetcher(self)
 
         if self.utxo_db.for_sync:
@@ -351,12 +357,8 @@ class BlockProcessor(server.db.DB):
         assert not self.history
         assert not self.utxo_cache
         assert not self.db_deletes
-        # Sapling cache should also be empty
-        if hasattr(self, 'sapling_cache'):
-            cache = self.sapling_cache
-            assert not cache.get('adds')
-            assert not cache.get('spends')
-            assert not cache.get('anchors')
+        assert not any(self.sapling_cache.values())
+        assert self.sapling_output_count == self.db_sapling_output_count
 
     def flush(self, flush_utxos=False):
         '''Flush out cached state.
@@ -389,19 +391,21 @@ class BlockProcessor(server.db.DB):
         with self.utxo_db.write_batch() as batch:
             if flush_utxos:
                 self.flush_utxos(batch)
-            # Flush Sapling data if any is cached
-            if hasattr(self, 'sapling_cache') and self.sapling_cache:
-                adds = self.sapling_cache.get('adds', [])
-                spends = self.sapling_cache.get('spends', [])
-                anchors = self.sapling_cache.get('anchors', [])
-                if adds or spends or anchors:
-                    self.logger.info(f'sapling flush: {len(adds)} outputs, '
-                                     f'{len(spends)} spends, '
-                                     f'{len(anchors)} anchors')
-                self.flush_sapling_data(
-                    batch.put, adds, spends, anchors, self.height
-                )
-                self.sapling_cache = {'adds': [], 'spends': [], 'anchors': []}
+                # Sapling data is flushed atomically with the UTXO
+                # state so a crash cannot persist output positions
+                # ahead of db_height (replay would double-assign them)
+                cache = self.sapling_cache
+                if any(cache.values()):
+                    self.logger.info(f'sapling flush: '
+                                     f'{len(cache["adds"])} outputs, '
+                                     f'{len(cache["spends"])} spends, '
+                                     f'{len(cache["anchors"])} anchors')
+                    self.flush_sapling_data(batch.put, cache['adds'],
+                                            cache['spends'],
+                                            cache['anchors'])
+                    self.sapling_cache = {'adds': [], 'spends': [],
+                                          'anchors': []}
+                self.db_sapling_output_count = self.sapling_output_count
             self.flush_state(batch)
 
         # Update and put the wall time again - otherwise we drop the
@@ -476,14 +480,11 @@ class BlockProcessor(server.db.DB):
         with self.utxo_db.write_batch() as batch:
             # Flush state last as it reads the wall time.
             self.flush_utxos(batch)
-            # Backup Sapling data for the reverted transactions
-            self.logger.info(f'sapling backup: removing data for tx >= '
-                             f'{self.tx_count}')
+            # Remove Sapling data for the reverted transactions.  The
+            # cache is empty here (reorg_chain flushes before backup).
             self.backup_sapling_data(self.tx_count, batch.delete,
                                      self.height + 1)
-            # Clear any cached Sapling data
-            if hasattr(self, 'sapling_cache'):
-                self.sapling_cache = {'adds': [], 'spends': [], 'anchors': []}
+            self._last_sapling_root = None
             self.flush_state(batch)
 
         self.logger.info('backup flush #{:,d} took {:.1f}s.  '
@@ -498,6 +499,9 @@ class BlockProcessor(server.db.DB):
         # requesting size from Python (see deep_getsizeof).
         one_MB = 1000*1000
         utxo_cache_size = len(self.utxo_cache) * 205
+        # Sapling entries flush with the UTXOs, so count them here
+        utxo_cache_size += sum(len(items) for items
+                               in self.sapling_cache.values()) * 100
         db_deletes_size = len(self.db_deletes) * 57
         hist_cache_size = len(self.history) * 180 + self.history_size * 4
         # Roughly ntxs * 32 + nblocks * 42
@@ -526,7 +530,10 @@ class BlockProcessor(server.db.DB):
 
         for block in blocks:
             height += 1
-            undo_info = self.advance_txs(block.transactions, height)
+            undo_info = self.advance_txs(block.transactions)
+            # After the block's outputs are counted, record its header's
+            # Sapling root the first time it appears
+            self.advance_sapling_anchor(block.header, height)
             if height >= min_height:
                 self.undo_infos.append((undo_info, height))
 
@@ -544,7 +551,7 @@ class BlockProcessor(server.db.DB):
                 self.check_cache_size()
                 self.next_cache_check = time.time() + 30
 
-    def advance_txs(self, txs, height=None):
+    def advance_txs(self, txs):
         self.tx_hashes.append(b''.join(tx_hash for tx, tx_hash in txs))
 
         # Use local vars for speed in the loops
@@ -559,10 +566,11 @@ class BlockProcessor(server.db.DB):
         undo_info_append = undo_info.append
         touched = self.touched
 
-        # Sapling data collection for batch flush
-        sapling_adds = []     # (tx_num, output_index, commitment)
-        sapling_spends = []   # (tx_num, spend_index, nullifier)
-        sapling_anchors = []  # (anchor, height) pairs seen in this block
+        # Sapling data collection for batch flush.  Global output
+        # positions are assigned here, in canonical block/tx/output
+        # order, and persisted at the next UTXO flush.
+        sapling_adds = self.sapling_cache['adds']
+        sapling_spends = self.sapling_cache['spends']
 
         for tx, tx_hash in txs:
             hashXs = set()
@@ -585,18 +593,19 @@ class BlockProcessor(server.db.DB):
                     put_utxo(tx_hash + s_pack('<H', idx),
                              hashX + tx_numb + s_pack('<Q', txout.value))
 
-            # Process Sapling shielded data if present
-            if hasattr(tx, 'sapling_spends') and tx.sapling_spends:
-                for spend_idx, spend in enumerate(tx.sapling_spends):
-                    sapling_spends.append((tx_num, spend_idx, spend.nullifier))
-                    sapling_anchors.append((spend.anchor, height))
+            # Index Sapling shielded data if present (only txs from a
+            # Sapling-capable deserializer carry these attributes)
+            for spend_idx, spend in enumerate(
+                    getattr(tx, 'sapling_spends', ())):
+                sapling_spends.append((tx_num, spend_idx, spend.nullifier))
 
-            if hasattr(tx, 'sapling_outputs') and tx.sapling_outputs:
-                for output_idx, output in enumerate(tx.sapling_outputs):
-                    # Store commitment (cmu) for lookup
-                    # Full output data is fetched from daemon at query time
-                    sapling_adds.append((tx_num, output_idx, output.cmu,
-                                         height))
+            for output_idx, output in enumerate(
+                    getattr(tx, 'sapling_outputs', ())):
+                # Store the commitment (cmu); full output data is
+                # fetched from the daemon at query time
+                sapling_adds.append((tx_num, output_idx, output.cmu,
+                                     self.sapling_output_count))
+                self.sapling_output_count += 1
 
             for hashX in hashXs:
                 history[hashX].append(tx_num)
@@ -608,17 +617,20 @@ class BlockProcessor(server.db.DB):
         self.tx_counts.append(tx_num)
         self.history_size = history_size
 
-        # Store Sapling data in cache for batch flush
-        if sapling_adds or sapling_spends or sapling_anchors:
-            if not hasattr(self, 'sapling_cache'):
-                self.sapling_cache = {'adds': [], 'spends': [], 'anchors': []}
-            self.sapling_cache['adds'].extend(sapling_adds)
-            self.sapling_cache['spends'].extend(sapling_spends)
-            self.sapling_cache['anchors'].extend(sapling_anchors)
-            self.logger.debug(f'sapling block: {len(sapling_adds)} outputs, '
-                              f'{len(sapling_spends)} spends')
-
         return undo_info
+
+    def advance_sapling_anchor(self, header, height):
+        '''Record the header's finalsaplingroot with the current tree
+        size, the first time the root appears.'''
+        sapling_start = getattr(self.coin, 'SAPLING_START_HEIGHT', None)
+        if (sapling_start is None or height < sapling_start
+                or len(header) < 112):
+            return
+        root = header[80:112]
+        if root != self._last_sapling_root:
+            self._last_sapling_root = root
+            self.sapling_cache['anchors'].append(
+                (root, height, self.sapling_output_count))
 
     def backup_blocks(self, raw_blocks):
         '''Backup the raw blocks and flush.

@@ -588,60 +588,59 @@ class DeserializerPIVXSapling(Deserializer):
     
     def read_tx(self):
         """Deserialize a PIVX transaction with Sapling support."""
-        start = self.cursor
-        
-        # Read header (contains version and potentially tx_type)
+        # Read header: int16 nVersion | int16 nType (DIP2-style)
         header = self._read_le_uint32()
         tx_type = header >> 16  # Upper 16 bits for DIP2 tx type
         if tx_type:
             version = header & 0x0000ffff
         else:
             version = header
-        
+
         # Handle case where tx_type is set but version < 3
         if tx_type and version < 3:
             version = header
             tx_type = 0
-        
+
         # Read transparent inputs and outputs
         inputs = self._read_inputs()
         outputs = self._read_outputs()
         locktime = self._read_le_uint32()
-        
+
         # Initialize Sapling fields
         value_balance = 0
         sapling_spends = []
         sapling_outputs = []
         binding_sig = b''
         extra_payload = b''
-        
+
         # Parse Sapling components (version >= 3)
         if version >= 3:
-            # Skip nExpiryHeight (encoded as varint in PIVX)
-            self._read_varint()
-            
-            # Value balance (signed 64-bit, positive = from shielded to transparent)
-            value_balance = self._read_le_int64()
-            
-            # Read shielded spends
-            spend_count = self._read_varint()
-            for _ in range(spend_count):
-                sapling_spends.append(self._read_sapling_spend())
-            
-            # Read shielded outputs
-            output_count = self._read_varint()
-            for _ in range(output_count):
-                sapling_outputs.append(self._read_sapling_output())
-            
-            # Binding signature (64 bytes, only if there are shielded components)
-            if sapling_spends or sapling_outputs:
-                binding_sig = self._read_nbytes(64)
-            
-            # Extra payload for special transaction types
-            if tx_type > 0:
-                payload_size = self._read_varint()
-                if payload_size > 0:
-                    extra_payload = self._read_nbytes(payload_size)
+            # Optional<SaplingTxData>: 1-byte presence flag, then the
+            # payload if the flag is non-zero.  PIVX Core always writes
+            # the flag for Sapling-version txs.
+            if self._read_byte():
+                # Value balance (signed 64-bit, positive = shielded to
+                # transparent)
+                value_balance = self._read_le_int64()
+
+                # Read shielded spends
+                spend_count = self._read_varint()
+                for _ in range(spend_count):
+                    sapling_spends.append(self._read_sapling_spend())
+
+                # Read shielded outputs
+                output_count = self._read_varint()
+                for _ in range(output_count):
+                    sapling_outputs.append(self._read_sapling_output())
+
+                # Binding signature, only if there are shielded components
+                if sapling_spends or sapling_outputs:
+                    binding_sig = self._read_nbytes(64)
+
+            # Optional<vector<uint8>> extraPayload for special tx types:
+            # 1-byte presence flag, then compact-size length + data
+            if tx_type > 0 and self._read_byte():
+                extra_payload = self._read_varbytes()
         
         return TxPIVXSapling(
             version,
